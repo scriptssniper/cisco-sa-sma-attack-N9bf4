@@ -317,22 +317,66 @@ def main(argv: List[str]) -> int:
     parser = argparse.ArgumentParser(
         description="Quick external exposure check for Cisco Secure Email/SMA (CVE-2025-20393).",
     )
-    parser.add_argument("target", help="Target host or domain")
+    parser.add_argument("target", nargs="?", help="Target host or domain (optional if --targets-file is used)")
+    parser.add_argument(
+        "-l", "--targets-file", help="File containing a list of targets (one per line)"
+    )
+    parser.add_argument(
+        "-w", "--max-workers", type=int, default=10, help="Number of concurrent workers for scanning multiple targets (default: 10)"
+    )
     parser.add_argument("-t", "--timeout", type=float, default=3.0, help="Connection timeout in seconds (default: 3)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Show all checks performed")
     parser.add_argument("-j", "--json", action="store_true", dest="json_output", help="Output results as JSON to stdout")
 
     args = parser.parse_args(argv)
-    try:
-        result = assess_risk(args.target, timeout=args.timeout, verbose=args.verbose, json_output=args.json_output)
-        if args.json_output:
-            print(json.dumps(result, indent=2))
-    except ValueError as exc:
-        if args.json_output:
-            print(json.dumps({"error": str(exc)}))
-        else:
-            print(exc)
+
+    if args.target and args.targets_file:
+        print("Error: Cannot specify both a single target and a targets file.", file=sys.stderr)
         return 1
+    if not args.target and not args.targets_file:
+        print("Error: Must specify either a target or a targets file.", file=sys.stderr)
+        return 1
+
+    targets: List[str] = []
+    if args.targets_file:
+        try:
+            with open(args.targets_file, "r") as f:
+                targets = [line.strip() for line in f if line.strip()]
+        except FileNotFoundError:
+            print(f"Error: Targets file '{args.targets_file}' not found.", file=sys.stderr)
+            return 1
+    else:
+        targets.append(args.target)
+
+    all_results: List[Dict[str, Any]] = []
+    if args.targets_file:
+        with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+            futures = {
+                executor.submit(assess_risk, target, args.timeout, args.verbose, args.json_output): target
+                for target in targets
+            }
+            for future in futures:
+                target = futures[future]
+                try:
+                    result = future.result()
+                    all_results.append(result)
+                except ValueError as exc:
+                    if args.json_output:
+                        all_results.append({"target": target, "error": str(exc)})
+                    else:
+                        print(f"Error scanning {target}: {exc}", file=sys.stderr)
+    else: # Single target
+        try:
+            result = assess_risk(targets[0], timeout=args.timeout, verbose=args.verbose, json_output=args.json_output)
+            all_results.append(result)
+        except ValueError as exc:
+            if args.json_output:
+                all_results.append({"target": targets[0], "error": str(exc)})
+            else:
+                print(f"Error scanning {targets[0]}: {exc}", file=sys.stderr)
+                
+    if args.json_output:
+        print(json.dumps(all_results, indent=2))
     return 0
 
 
